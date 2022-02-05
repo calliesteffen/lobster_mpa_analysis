@@ -1,0 +1,1336 @@
+---
+title: "ESM 254 - Lobster Paper"
+author: "Laura Ingulsrud"
+date: "4/21/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE)
+
+library(tidyverse)
+library(dplyr)
+library(here)
+library(janitor)
+library(ggbeeswarm)
+library(car)
+
+# spatial packages
+library(sf)
+library(mapview)
+library(raster)
+library(leaflet)
+library(scales)
+library(tmap)
+library(tmaptools)
+library(gstat)
+library(rgeos)
+library(rgdal)
+
+
+```
+
+```{r data}
+
+#Reading in lobster data frames and spatial data 
+
+## read in dataset containing lobster landings reported as lbs and value of catch
+lobster_pounds <- read_csv(here("data", "#1_Lobster_landings_lbs_value_1998-2018.csv")) %>% 
+  clean_names()
+
+## read in dataset containing number of lobsters caught reported from CDFW logbooks
+lobster_numbers <- read_csv(here("data", "#2_lobster_logbook_#oflobsters_1998-2018.csv")) %>% 
+  clean_names() %>% 
+  rename(season_year = season) # rename season to "season_year" so doesn't conflict with season numbering in lobster_pounds
+
+
+## full join by year/month/block to retain all data in both datasets
+lobsters <- full_join(lobster_pounds, lobster_numbers, by = c("year", "month", "block"))
+
+
+## read in shapefile for CDFW fishing blocks and only select necessary columns
+blocks_sf <- read_sf(here("shapefiles", "CON_SCSR_CFIS_Blocks/CON_SCSR_Blocks_clean.shp")) %>% 
+  clean_names() %>% 
+  dplyr::select(block10_id, shape_area, shape_len, geometry) %>% 
+  rename(block = block10_id)
+
+## explore blocks_sf
+object.size(blocks_sf)
+head(blocks_sf)
+class(blocks_sf)
+st_crs(blocks_sf) # EPSG: 3310
+plot(blocks_sf)
+
+
+## read in shapefile for MPA boundaries
+mpa_sf <- read_sf(here("shapefiles", "MPAboundaries_ds582/ds582.shp")) %>% 
+  clean_names()
+
+## explore mpa_sf
+object.size(mpa_sf)
+head(mpa_sf)
+class(mpa_sf)
+st_crs(mpa_sf) # EPSG: 3310
+plot(mpa_sf)
+
+```
+
+```{r reserveblocks}
+
+#Creating list of reserve blocks (blocks that should be impacted by spillover from marine reserves)
+
+## intersect fishing blocks with MPA boundaries that are buffered 10m
+reserve_blocks <- st_intersection(blocks_sf, st_buffer(mpa_sf, 10))
+
+## create dataframe of fishing block #s within reserves (get rid of sticky geometries)
+reserve_blocks_df <- as.data.frame(reserve_blocks) %>% 
+  dplyr::select(block)
+
+## create unique list of fishing blocks within reserves + 10m buffer
+reserve_blocks_list <- reserve_blocks_df %>% 
+  distinct()
+
+write_csv(reserve_blocks_list,"reserve_blocks.csv")
+
+```
+
+```{r controlblocks}
+
+#Generate list of control blocks that do not receive any spillover from reserves 
+
+## identify control fishing blocks that don't intersect reserve blocks
+
+## create dataframe of fishing block #s (get rid of sticky geometries)
+blocks_df <- as.data.frame(blocks_sf) %>% 
+  dplyr::select(block)
+
+## create list of "control" fishing blocks outside of reserves
+control_blocks_list <- anti_join(blocks_df, reserve_blocks_list)
+write.csv(control_blocks_list, "control_blocks.csv")
+
+
+
+```
+
+```{r lobsterblocks}
+
+
+#Joining lobster data frames and dictating as control or reserve blocks 
+
+
+
+## full join by block
+# Create classification column 
+# select relevant columns (omit spatial information)
+# Try to get the season_year characteristic to numeric and useable format NASTY 
+
+
+## review this- why call it reserve blocks- geometry only? but has all other make separate?
+lobster_reserve_blocks <- full_join(lobsters, reserve_blocks, by = c("block")) %>% 
+  mutate(classification = if_else(is.na(name), "control", "reserve"))%>% 
+  clean_names()
+
+
+# Make spatial - This will have all control and reserve blocks
+lobster_reserve_blocks_sf <- lobster_reserve_blocks %>% 
+  st_as_sf(sf_column_name = "geometry")
+
+# Make spatial Reserve
+lobster_reserve_blocks_sf_2 <- lobster_reserve_blocks %>% 
+  st_as_sf(sf_column_name = "geometry") %>% 
+  filter(classification == "reserve")
+
+write.csv(lobster_reserve_blocks_sf_2, "lobster_data_reserve_blocks.csv")
+# Filter out control blocks
+lobster_control <- lobster_reserve_blocks %>% 
+  filter(classification == "control") %>% 
+  dplyr::select(-geometry)
+
+write.csv(lobster_control, "lobster_data_control_blocks.csv")
+
+# Join filtered out control blocks with fishing blocks shapefile by block number
+# Make spatial
+lobster_control_blocks <- left_join(lobster_control, blocks_sf, by = "block") %>% 
+  st_as_sf(sf_column_name = "geometry")
+
+```
+
+```{r restrict spatial data to study area}
+
+
+#Restricting spatial data to south of Piedras Blancas  
+# Filter to only include fishing blocks below Piedras Blancas (fishing blocks between #601 and #916)
+
+lobster_blocks_pb <- blocks_sf %>% 
+  filter(block %in% (601:916))
+
+reserve_pb<- lobster_reserve_blocks_sf_2 %>% 
+  filter(block %in% (601:916))
+
+control_pb<- lobster_control_blocks %>% 
+  filter(block %in% (601:916))
+
+
+
+
+```
+
+```{r lobsterpounds}
+
+#Data wrangling with lobster data 
+
+#change season year to the first year of the season, and to numeric for r to understand 
+#ignore irrelevant columns 
+
+season_catch <- lobster_reserve_blocks %>% 
+  dplyr::select(block,
+                month, 
+                total_legals_retained, 
+                total_pounds_landed, 
+                total_traps_pulled, 
+                season_year,
+                total_value,
+                season,
+                shortname,
+                classification) %>% 
+  mutate(year = case_when(season == 1 ~"1998",
+                          season == 2 ~"1999",
+                          season == 3 ~"2000",
+                          season == 4 ~"2001",
+                          season == 5 ~"2002",
+                          season == 6 ~"2003",
+                          season == 7 ~"2004",
+                          season == 8 ~"2005",
+                          season == 9 ~"2006",
+                          season == 10 ~"2007",
+                          season == 11 ~"2008",
+                          season == 12 ~"2009",
+                          season == 13 ~"2010",
+                          season == 14 ~"2011",
+                          season == 15 ~"2012",
+                          season == 16 ~"2013",
+                          season == 17 ~"2014",
+                          season == 18 ~"2015",
+                          season == 19 ~"2016",
+                          season == 20 ~"2017")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "1998-99", 
+                               "1998")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "1999-00", 
+                               "1999")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2000-01", 
+                               "2000")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2001-02", 
+                               "2001")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2002-03", 
+                               "2002")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2003-04", 
+                               "2003")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2004-05", 
+                               "2004")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2005-06", 
+                               "2005")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2006-07", 
+                               "2006")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2007-08", 
+                               "2007")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2008-09", 
+                               "2008")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2009-10", 
+                               "2009")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2010-11", 
+                               "2010")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2011-12", 
+                               "2011")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2012-13", 
+                               "2012")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2013-14", 
+                               "2013")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2014-15", 
+                               "2014")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2015-16", 
+                               "2015")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2016-17", 
+                               "2016")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2017-18", 
+                               "2017")) %>% 
+  mutate(season_year = as.numeric(season_year)) %>% 
+  mutate(year = ifelse(is.na(year), season_year, year)) %>% 
+  mutate(year = as.numeric(year)) %>% 
+  filter(block > 602) %>% 
+  dplyr::select(-season_year, -season) %>% 
+  filter(!(block %in% c("690","689", "688" ,"711" ,"712" ,"710" ,"709", "687" ,"685", "707","708","713","714", "684", "765", "764","744","745"))) %>% 
+  mutate(classification = as_factor(classification))
+
+write.csv(season_catch, "classificcation.csv")
+
+as.data.frame(season_catch)
+
+reserve_control <- season_catch %>% 
+dplyr::select(block,classification) %>% 
+  unique()
+
+reserve <- reserve_control %>% 
+  filter(classification == "reserve")
+
+control <- reserve_control %>% 
+  filter(classification== "control")
+
+write.csv(control, "control.csv")
+write.csv(reserve, "reserve.csv")
+
+study_blocks_list <- as.data.frame(unique(season_catch$block))
+
+write.csv(study_blocks_list, "blocks_in_analysis.csv")
+
+```
+
+```{r lobster summary }
+
+#Making a summary table for pounds landed 
+#Calculating cpue 
+#lobster_summary_lbs is final df
+
+
+
+#breaking up steps 
+
+omit_lbs <- season_catch %>% 
+  dplyr::select(block, 
+                month, 
+                total_pounds_landed, 
+                total_traps_pulled, 
+                classification, 
+                year,
+                total_value)
+
+omit_na_lbs <- omit_lbs %>% 
+  na.omit()
+
+
+#doing it in separate data frames allows me to omit jsut the data that we need for this calc (lbs and traps)
+  
+
+#Create summary table 
+#Time variable and metrics only agree with eachother if nas are omitted correctly - different metrics must be regarded separately
+#calculate CPUE in terms of total pounds landed/ traps pulled 
+
+lobster_summary_lbs <- omit_na_lbs %>% 
+  group_by(classification, year) %>% 
+  summarise(total_traps = sum(total_traps_pulled), 
+            season_pounds_landed = sum(total_pounds_landed), 
+            sd_traps = round(sd(total_traps_pulled), digits = 3),             sd_pounds = round(sd(total_pounds_landed), digits = 3),
+          value = sum(total_value))
+  
+          lobster_summary_lbs <- lobster_summary_lbs %>%
+        mutate(CPUE_lbs = season_pounds_landed/total_traps)
+
+
+
+
+###########################################
+#Making a summary table for legals retained
+#Calculating cpue 
+#lobster_summary_leg is final df
+
+
+
+#breaking up steps 
+
+omit_leg <- season_catch %>% 
+  dplyr::select(block, 
+                month, 
+                total_legals_retained, 
+                total_traps_pulled, 
+                classification, 
+                year)
+
+omit_na_leg <- omit_leg %>% 
+  na.omit()
+
+
+#doing it in separate data frames allows me to omit jsut the data that we need for this calc (lbs and traps)
+  
+
+#Create summary table 
+#Time variable and metrics only agree with eachother if nas are omitted correctly - different metrics must be regarded separately
+#calculate CPUE in terms of total pounds landed/ traps pulled 
+
+lobster_summary_leg <- omit_na_leg %>% 
+  group_by(classification, year) %>% 
+  summarise(total_traps = sum(total_traps_pulled), 
+            season_legals_retained = sum(total_legals_retained), 
+            sd_traps = round(sd(total_traps_pulled), digits = 3), 
+            sd_pounds = round(sd(total_legals_retained), digits = 3)) %>% 
+  mutate(CPUE_leg = season_legals_retained/total_traps)
+
+```
+
+
+```{r Before and After reserve implementation}
+
+#THIS ONLY works for coastal reserves not Channel Islands
+#Designating before and after time periods 
+
+#looking at pounds landed before and after
+
+#change time metrics to before and after reserve implementation 
+#filter out 2005 and before 
+#2012 is the first reserve year, so subtract 2011 from season_year
+
+coastal_pounds_ba <- lobster_summary_lbs %>% 
+  filter(year > 2005) %>% 
+  mutate(years_ba_res = year-2011) %>% 
+  mutate(log_traps = log(total_traps +1)) %>% 
+  mutate(log_pounds = log(season_pounds_landed + 1)) %>% 
+  mutate(period = if_else(years_ba_res > 0,"after", "before")) %>% 
+   mutate(period = as_factor(period))
+
+write.csv(coastal_pounds_ba, "all_blocks_pounds_comparison_10-4-2020.csv")
+view(coastal_pounds_ba)
+
+### looking at legals retained before and after
+
+coastal_legals_ba <- lobster_summary_leg %>% 
+  filter(year > 2005) %>% 
+  mutate(years_ba_res = year-2011) %>% 
+  mutate(log_traps = log(total_traps +1)) %>% 
+  mutate(log_legals = log(season_legals_retained + 1)) %>% 
+  mutate(period = if_else(years_ba_res > 0,"after", "before")) %>%
+   mutate(period = as_factor(period))
+
+
+```
+
+```{r Averages for before and after}
+
+
+#summarizing before and after reserve implementation periods  
+#LEGALS
+coastal_legals_avg <- coastal_legals_ba %>% 
+  mutate(period = if_else(years_ba_res > 0,"after", "before")) %>% 
+  group_by(classification, period) %>% 
+  summarise(average_legals = mean(season_legals_retained), 
+            average_effort = mean(total_traps), 
+            average_CPUE = mean(CPUE_leg))
+
+# POUNDS
+
+coastal_pounds_avg <- coastal_pounds_ba %>% 
+  mutate(period = if_else(years_ba_res > 0,"after", "before")) %>% 
+  group_by(classification, period) %>% 
+  summarise(average_pounds = mean(season_pounds_landed),
+            average_effort = mean(total_traps), 
+            average_CPUE = mean(CPUE_lbs))
+
+
+```
+
+```{r ANOVAs}
+
+
+# legals nonlogged and log
+# pounds nonlogged and log
+#traps nonlogged and log
+#CPUE by pounds
+#CPUE by legals
+
+#CPUE ANOVAS
+
+cpue_pounds <- aov(CPUE_lbs ~ classification * period, data = coastal_pounds_ba)
+
+summary(cpue_pounds)
+
+cpue_legals <- aov(CPUE_leg ~ classification * period, data = coastal_legals_ba)
+
+summary(cpue_legals)
+
+#LEGALS ANOVAS
+
+anova_legals_log <- aov(log_legals ~ classification * period ,data= coastal_legals_ba)
+
+summary(anova_legals_log)
+
+anova_legals <- aov(season_legals_retained ~ classification * period ,data= coastal_legals_ba)
+
+summary(anova_legals)
+
+# POUNDS ANOVAS
+
+anova_pounds_log <- aov(log_pounds ~ classification * period ,data= coastal_pounds_ba)
+
+summary(anova_pounds_log)
+
+anova_pounds <- aov(season_pounds_landed~ classification * period ,data= coastal_pounds_ba)
+
+summary(anova_pounds)
+
+
+#TRAPS POUNDS ANOVAS
+
+traps_pounds <- aov(total_traps ~ classification * period ,data= coastal_pounds_ba)
+
+summary(traps_pounds)
+
+traps_pounds_log <- aov(log_traps ~ classification * period ,data= coastal_pounds_ba)
+
+summary(traps_pounds_log)
+
+
+#TRAP LEGALS ANOVAS
+
+traps_legals <- aov(total_traps ~ classification * period ,data= coastal_legals_ba)
+
+summary(traps_legals)
+
+traps_legals_log <- aov(log_traps ~ classification * period ,data= coastal_legals_ba)
+
+summary(traps_legals_log)
+
+
+
+
+```
+
+```{r,North and South}
+
+#North: all blocks less than 681 (except for 680, 679, 678)
+#Still excluding northern channel islands
+
+north <- season_catch %>% 
+  filter(block < "681") %>% 
+  filter(!(block %in% c("680","679", "678")))
+
+
+
+south <- anti_join(season_catch,north, by = "block")
+
+all_blocks_analysis <- unique(season_catch$block) #251
+
+view(all_blocks_analysis)
+
+north_analysis <- unique(north$block) #68
+
+view(north_analysis)
+
+south_analysis <- unique(south$block) #183
+
+view(south_analysis)
+
+as.data.frame(north_analysis)
+as.data.frame(south_analysis)
+
+write.csv(north_analysis, "blocks_north.csv")
+write.csv(south_analysis, "blocks_south.csv")
+##########################################
+
+#make Spatial
+# Make spatial - This will have all control and reserve blocks
+north_spatial <- merge(blocks_sf, north, by = "block") 
+south_spatial <- merge(blocks_sf,south, by = "block")
+
+
+
+```
+
+```{r}
+#breaking up steps 
+
+omit_lbs_north <- north %>% 
+  dplyr::select(block, 
+                month, 
+                total_pounds_landed, 
+                total_traps_pulled, 
+                classification, 
+                year,
+                total_value)
+
+omit_na_lbs_north <- omit_lbs_north %>% 
+  na.omit()
+
+
+#doing it in separate data frames allows me to omit jsut the data that we need for this calc (lbs and traps)
+  
+lobster_summary_lbs_north <- omit_na_lbs_north %>% 
+  group_by(classification, year) %>% 
+  summarise(total_traps = sum(total_traps_pulled), 
+            season_pounds_landed = sum(total_pounds_landed), 
+            sd_traps = round(sd(total_traps_pulled), digits = 3), 
+            sd_pounds = round(sd(total_pounds_landed), digits = 3),
+            total_value = sum(total_value))  %>% 
+  mutate(CPUE_lbs = season_pounds_landed/total_traps)
+
+lobster_summary_lbs_north
+
+
+###########################################
+#Making a summary table for legals retained
+#Calculating cpue 
+
+omit_leg_north <- north %>% 
+  dplyr::select(block, 
+                month, 
+                total_legals_retained, 
+                total_traps_pulled, 
+                classification, 
+                year)
+
+omit_na_leg_north <- omit_leg_north %>% 
+  na.omit()
+
+
+#doing it in separate data frames allows me to omit jsut the data that we need for this calc (lbs and traps)
+  
+#Create summary table 
+#Time variable and metrics only agree with eachother if nas are omitted correctly - different metrics must be regarded separately
+#calculate CPUE in terms of total pounds landed/ traps pulled 
+
+lobster_summary_leg_north <- omit_na_leg_north %>% 
+  group_by(classification, year) %>% 
+  summarise(total_traps = sum(total_traps_pulled), 
+            season_legals_retained = sum(total_legals_retained), 
+            sd_traps = round(sd(total_traps_pulled), digits = 3), 
+            sd_pounds = round(sd(total_legals_retained), digits = 3)) %>% 
+  mutate(CPUE_leg = season_legals_retained/total_traps)
+
+
+
+coastal_pounds_ba_north <- lobster_summary_lbs_north %>% 
+  filter(year > 2005) %>% 
+  mutate(years_ba_res = year-2011) %>% 
+  mutate(log_traps = log(total_traps +1)) %>% 
+  mutate(log_pounds = log(season_pounds_landed + 1)) %>% 
+  mutate(period = if_else(years_ba_res > 0,"after", "before")) %>% 
+   mutate(period = as_factor(period))
+
+view(coastal_pounds_ba_north)
+
+write.csv(coastal_pounds_ba_north, "northern_blocks_pounds_comparison_10-4-2020.csv")
+
+
+### looking at legals retained before and after
+
+coastal_legals_ba_north <- lobster_summary_leg_north %>% 
+  filter(year > 2005) %>% 
+  mutate(years_ba_res = year-2011) %>% 
+  mutate(log_traps = log(total_traps +1)) %>% 
+  mutate(log_legals = log(season_legals_retained + 1)) %>% 
+  mutate(period = if_else(years_ba_res > 0,"after", "before")) %>%
+   mutate(period = as_factor(period))
+
+```
+
+```{r}
+##ANOVAS THAT MATTER
+
+#north
+cpue_pounds_north <- aov(CPUE_lbs ~ classification * period, data = coastal_pounds_ba_north)
+
+summary(cpue_pounds_north)
+
+eff_pounds_north <- aov(total_traps ~ classification * period, data = coastal_pounds_ba_north)
+
+summary(eff_pounds_north)
+
+catch_pounds_north <- aov(season_pounds_landed ~ classification * period, data = coastal_pounds_ba_north)
+
+summary(catch_pounds_north)
+
+#south
+
+cpue_pounds_south <- aov(CPUE_lbs ~ classification * period, data = coastal_pounds_ba_south)
+
+summary(cpue_pounds_south)
+
+eff_pounds_south <- aov(total_traps ~ classification * period, data = coastal_pounds_ba_south)
+
+summary(eff_pounds_south)
+
+catch_pounds_south <- aov(season_pounds_landed ~ classification * period, data = coastal_pounds_ba_south)
+
+summary(catch_pounds_south)
+
+## all 
+cpue_pounds_all <- aov(CPUE_lbs ~ classification * period, data = coastal_pounds_ba)
+
+summary(cpue_pounds_all)
+
+eff_pounds_all <- aov(total_traps ~ classification * period, data = coastal_pounds_ba)
+
+summary(eff_pounds_all)
+
+catch_pounds_all <- aov(season_pounds_landed ~ classification * period, data = coastal_pounds_ba)
+
+summary(catch_pounds_all)
+
+```
+
+```{r,ANOVAS North}
+# legals nonlogged and log
+# pounds nonlogged and log
+#traps nonlogged and log
+#CPUE by pounds
+#CPUE by legals
+
+#CPUE ANOVAS
+
+cpue_pounds_north <- aov(CPUE_lbs ~ classification * period, data = coastal_pounds_ba_north)
+
+summary(cpue_pounds_north)
+
+eff_pounds_north <- aov(total_traps ~ classification * period, data = coastal_pounds_ba_north)
+
+summary(eff_pounds_north)
+
+catch_pounds_north <- aov(season_pounds_landed ~ classification * period, data = coastal_pounds_ba_north)
+
+summary(catch_pounds_north)
+
+cpue_legals_north <- aov(CPUE_leg ~ classification * period, data = coastal_legals_ba_north)
+
+summary(cpue_legals_north)
+
+#LEGALS ANOVAS
+
+anova_legals_log_north <- aov(log_legals ~ classification * period ,data= coastal_legals_ba_north)
+
+summary(anova_legals_log_north)
+
+anova_legals_north <- aov(season_legals_retained ~ classification * period ,data= coastal_legals_ba_north)
+
+summary(anova_legals_north)
+
+# POUNDS ANOVAS
+
+anova_pounds_log_north <- aov(log_pounds ~ classification * period ,data= coastal_pounds_ba_north)
+
+summary(anova_pounds_log_north)
+
+anova_pounds_north <- aov(season_pounds_landed~ classification * period ,data= coastal_pounds_ba_north)
+
+summary(anova_pounds_north)
+
+# found significant difference in Pounds landed in the north so doing a Post HOC test
+
+postHOC_interaction <- TukeyHSD(anova_pounds_north, which = "classification:period")
+
+postHOC_period <- TukeyHSD(anova_pounds_north, which = "period")
+
+
+postHOC_classification <- TukeyHSD(anova_pounds_north, which = "classification")
+
+#TRAPS POUNDS ANOVAS
+
+traps_pounds_north <- aov(total_traps ~ classification * period ,data= coastal_pounds_ba_north)
+
+summary(traps_pounds_north)
+
+traps_pounds_log_north <- aov(log_traps ~ classification * period ,data= coastal_pounds_ba_north)
+
+summary(traps_pounds_log_north)
+
+
+#TRAP LEGALS ANOVAS
+
+traps_legals_north <- aov(total_traps ~ classification * period ,data= coastal_legals_ba_north)
+
+summary(traps_legals_north)
+
+traps_legals_log_north <- aov(log_traps ~ classification * period ,data= coastal_legals_ba_north)
+
+summary(traps_legals_log_north)
+
+
+```
+
+```{r, south blocks}
+#breaking up steps 
+
+omit_lbs_south <- south %>% 
+  dplyr::select(block, 
+                month, 
+                total_pounds_landed, 
+                total_traps_pulled, 
+                classification, 
+                year,
+                total_value)
+
+omit_na_lbs_south <- omit_lbs_south %>% 
+  na.omit()
+
+
+#doing it in separate data frames allows me to omit jsut the data that we need for this calc (lbs and traps)
+  
+lobster_summary_lbs_south <- omit_na_lbs_south %>% 
+  group_by(classification, year) %>% 
+  summarise(total_traps = sum(total_traps_pulled), 
+            season_pounds_landed = sum(total_pounds_landed), 
+            sd_traps = round(sd(total_traps_pulled), digits = 3), 
+            sd_pounds = round(sd(total_pounds_landed), digits = 3),
+            total_value = sum(total_value)) %>% 
+  mutate(CPUE_lbs = season_pounds_landed/total_traps)
+
+lobster_summary_lbs_south
+
+
+###########################################
+#Making a summary table for legals retained
+#Calculating cpue 
+
+omit_leg_south <- south %>% 
+  dplyr::select(block, 
+                month, 
+                total_legals_retained, 
+                total_traps_pulled, 
+                classification, 
+                year)
+
+omit_na_leg_south <- omit_leg_south %>% 
+  na.omit()
+
+
+#doing it in separate data frames allows me to omit jsut the data that we need for this calc (lbs and traps)
+  
+#Create summary table 
+#Time variable and metrics only agree with eachother if nas are omitted correctly - different metrics must be regarded separately
+#calculate CPUE in terms of total pounds landed/ traps pulled 
+
+lobster_summary_leg_south <- omit_na_leg_south %>% 
+  group_by(classification, year) %>% 
+  summarise(total_traps = sum(total_traps_pulled), 
+            season_legals_retained = sum(total_legals_retained), 
+            sd_traps = round(sd(total_traps_pulled), digits = 3), 
+            sd_pounds = round(sd(total_legals_retained), digits = 3)) %>% 
+  mutate(CPUE_leg = season_legals_retained/total_traps)
+
+
+
+coastal_pounds_ba_south <- lobster_summary_lbs_south %>% 
+  filter(year > 2005) %>% 
+  mutate(years_ba_res = year-2011) %>% 
+  mutate(log_traps = log(total_traps +1)) %>% 
+  mutate(log_pounds = log(season_pounds_landed + 1)) %>% 
+  mutate(period = if_else(years_ba_res > 0,"after", "before")) %>% 
+   mutate(period = as_factor(period))
+
+write.csv(coastal_pounds_ba_south, "southern_block_pounds_comparison_10-4-2020.csv")
+
+
+### looking at legals retained before and after
+
+coastal_legals_ba_south <- lobster_summary_leg_south %>% 
+  filter(year > 2005) %>% 
+  mutate(years_ba_res = year-2011) %>% 
+  mutate(log_traps = log(total_traps +1)) %>% 
+  mutate(log_legals = log(season_legals_retained + 1)) %>% 
+  mutate(period = if_else(years_ba_res > 0,"after", "before")) %>%
+   mutate(period = as_factor(period))
+
+```
+
+```{r, Anovas South}
+
+# legals nonlogged and log
+# pounds nonlogged and log
+#traps nonlogged and log
+#CPUE by pounds
+#CPUE by legals
+
+#CPUE ANOVAS
+
+cpue_pounds_south <- aov(CPUE_lbs ~ classification * period, data = coastal_pounds_ba_south)
+
+summary(cpue_pounds_south)
+
+cpue_legals_south <- aov(CPUE_leg ~ classification * period, data = coastal_legals_ba_south)
+
+summary(cpue_legals_south)
+
+#LEGALS ANOVAS
+
+anova_legals_log_south <- aov(log_legals ~ classification * period ,data= coastal_legals_ba_south)
+
+summary(anova_legals_log_south)
+
+anova_legals_south <- aov(season_legals_retained ~ classification * period ,data= coastal_legals_ba_south)
+
+summary(anova_legals_south)
+
+# POUNDS ANOVAS
+
+anova_pounds_log_south <- aov(log_pounds ~ classification * period ,data= coastal_pounds_ba_south)
+
+summary(anova_pounds_log_south)
+
+anova_pounds_south <- aov(season_pounds_landed~ classification * period ,data= coastal_pounds_ba_south)
+
+summary(anova_pounds_south)
+
+
+#TRAPS POUNDS ANOVAS
+
+traps_pounds_south <- aov(total_traps ~ classification * period ,data= coastal_pounds_ba_south)
+
+summary(traps_pounds_south)
+
+traps_pounds_log_south <- aov(log_traps ~ classification * period ,data= coastal_pounds_ba_south)
+
+summary(traps_pounds_log_south)
+
+
+#TRAP LEGALS ANOVAS
+
+traps_legals_south <- aov(total_traps ~ classification * period ,data= coastal_legals_ba_south)
+
+summary(traps_legals_south)
+
+traps_legals_log_south <- aov(log_traps ~ classification * period ,data= coastal_legals_ba_south)
+
+summary(traps_legals_log_south)
+
+
+```
+
+```{r Bathymetry}
+#Depth, gebco.net
+
+# Get Extent of blocks_crs
+extent(blocks_crs)
+#xmin       : -125.6679 
+#xmax       : -117.097 
+#ymin       : 32.33338 
+#ymax       : 41.99988 
+
+
+# Extent of our study area
+#xmin = 122.5
+#xmax = -117.097
+#ymin = 32.3338
+#ymax = 35.666
+
+# Create a Blank Raster of desired extent
+blank_raster_crs <- raster(nrows = 2320, ncols = 2057, xmn = -122.5, xmx = -117.0958, ymn = 32.33333, ymx = 35.666,
+       crs = '+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 ')
+
+# Read in Depth from GEBCO
+depth <- raster("blocks_crs_bathymetry.tif")
+# Depth boundaries were selected on GEBCO. We can define lat,long boundaries and resample
+
+# Plot Depth
+plot(depth)
+
+# View CRS
+st_crs(depth)
+
+#  Do not need to Reproject because is in WGS84
+#depth_proj <- projectRaster(depth, crs = "+proj=utm +zone=37 +south +datum=WGS84")
+
+# Crop bathymetry to study area
+study_bath <- crop(depth, blank_raster_crs)
+
+plot(study_bath)
+
+# Defining miniumum and maximum depths
+min_depth <- 0
+max_depth <- -100
+# Depth limit is set at 100 m. We should verify this is correct and can change it
+  
+
+  
+# Reclassify matrix for depth layer that makes unsuitable cells 1 (>300 m), suitable cells 2 (<300 m), and NAs 0
+  rcl_mat_depth <- c(-Inf, max_depth, 1,
+                              max_depth, min_depth, 2,
+                              min_depth, 0, 1,
+                              0, Inf, 0)
+  
+# Reclassify the depth layer as binary
+depth_binary_1 <- reclassify(study_bath,rcl= rcl_mat_depth)
+  
+
+
+# Plot the binary depth    
+plot(depth_binary_1)
+
+# Write a Raster
+writeRaster(depth_binary_1, "data/depth_binary.tif", overwrite = T)
+
+
+# Crop Fishing Blocks
+blocks_study <- st_crop(blocks_sf, blank_raster_crs)
+
+# Crop Reserves
+mpas_control_study <- st_crop(lobster_control_blocks, blank_raster_crs)
+mpas_reserve_study <- st_crop(lobster_reserve_blocks_sf, blank_raster_crs)
+# Rasterize and Crop MPAs
+mpas_rast <- rasterize(mpa_crs, blank_raster_crs)
+
+
+# Visualize, Fishing Blocks, Reserves, and Bathymetry
+combined_map <- mapview(blocks_study,
+                        layer.name = "Fishing Blocks")+
+  mapview(mpas_rast, 
+          layer.name = "MPAs")+
+  mapview(depth_binary_1)
+combined_map
+
+# Visualize, Fishing Blocks, Reserves, and Bathymetry
+reserve_control_bath_map <- mapview(blocks_sf,
+          zcol = "block",
+          col.regions = "gray",
+          layer.name = "Fishing Blocks") +
+  mapview(lobster_reserve_blocks_sf,
+                               zcol = "block",
+                               col.regions = "red",
+                               layer.name = "Reserves") +
+  mapview(lobster_control_blocks,
+          zcol = "block",
+          col.regions = "blue",
+          layer.name = "Control Blocks") +
+  mapview(depth_binary_1,
+          layer.name = "Depth")
+
+reserve_control_bath_map
+
+
+
+
+# Number of cells that are N/A or 0 (land) 2570275
+land_sum_cells <- sum(depth_binary_1[] < 1)
+
+# Number of cells that are suitable or 2 (less than 300 ft) 130917
+suitable_sum_cells <- sum(depth_binary_1[] >1)
+
+#  Number of cells that are unsuitable or 1 (greater than 300 ft) 2071048
+unsuitable_sum_cells_land <- sum(depth_binary_1[] <2) #4641323
+unsuitable_sum_cells <- unsuitable_sum_cells_land - land_sum_cells
+unsuitable_sum_cells
+
+# **** Need to multiple number of cells by resolution to get area! ^
+# resolution : 0.004166667, 0.004166667  (x, y) -> is this in decimal degrees? How to convert to meters?
+
+### Subtract Area of Depth by MPAs to see change in number of cells
+# Crop out the MPAs raster
+# Create an Empty raster
+blank_raster_crs <- raster(nrows = 2320, ncols = 2057, xmn = -122.5, xmx = -117.0958, ymn = 32.33333, ymx = 35.666,
+       crs = '+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 ')
+
+# Rasterize MPAs
+mpas_rast <- rasterize(mpa_crs, blank_raster_crs)
+
+# Subtract Area of MPAs from Depth
+depth_wo_mpas <- crop(mpas_rast, depth_binary_1)
+plot(depth_wo_mpas)
+
+
+# Number of cells that are N/A or 0 (land) 0
+land_sum_cells_mpas <- sum(depth_wo_mpas[] < 1)
+land_sum_cells_mpas
+
+# Number of cells that are suitable or 2 (less than 300 ft) 130917
+suitable_sum_cells_mpas <- sum(depth_wo_mpas[] >1)
+suitable_sum_cells_mpas
+
+#  Number of cells that are unsuitable or 1 (greater than 300 ft) 2071048
+unsuitable_sum_cells_land_mpas <- sum(depth_wo_mpas[] <2) #4641323
+unsuitable_sum_cells_mpas <- unsuitable_sum_cells_land_mpas - land_sum_cells_mpas
+unsuitable_sum_cells_mpas
+
+
+#######################
+
+## Info / Layers from GIS Analysis
+
+# total area of suitable depth in study area: 12638571564.3 square meters
+# area of suitable depth in study reserves that was closed to fishing: 699584301.407 square meters
+
+# %reduction in suitable depth (fishable area): 5.53531146972 %
+
+# cell size: 2193054.23639 square meters
+# of cells in total suitable depth: 5763
+# of cells in suitable depth within reserves: 319
+
+# read in layers made in GIS
+
+suitable_depth_reserves <- raster::raster(here::here("depth_gislayers", "suitable_depth_reserves1.tif"))
+suitable_depth_studyblocks <- raster::raster(here::here("depth_gislayers", "suitable_depth_study_blocks1.tif"))
+study_blocks <- read_sf(here("depth_gislayers", "study_blocks.shp"))%>% 
+  clean_names() %>% 
+  dplyr::select(block10_id, shape_area, shape_len, geometry) %>% 
+  rename(block = block10_id)
+
+depth_areas_map <- mapview(study_blocks,
+                       zcol = "block",
+                       col.regions = "gray",
+                       layer.name = "Fishing Blocks") +
+  mapview(suitable_depth_reserves,
+          layer.name = "Suitable Fishing Area - Reserves") +
+  mapview(suitable_depth_studyblocks,
+          layer.name = "Suitable Fishing Area - Study Blocks")
+
+depth_areas_map
+
+##########################
+
+# Visualize Total Legals Retained, Fishing Blocks, Reserves, and Bathymetry
+bath_blocks_legals_retained_map <- mapview(blocks_sf,
+          zcol = "block",
+          col.regions = "gray",
+          layer.name = "Fishing Blocks") +
+  mapview(lobster_reserve_blocks_sf,
+          zcol = "total_legals_retained",
+          at = seq(0, 10000, 100), legend = TRUE,
+          layer.name = "Total Legal Lobsters Retained (Reserves)") +
+  mapview(lobster_control_blocks,
+          zcol = "total_legals_retained",
+          at = seq(0, 10000, 100), legend = TRUE,
+          layer.name = "Total Legal Lobsters Retained (Control)") +
+  mapview(depth_binary_1)
+
+bath_blocks_legals_retained_map
+```
+
+
+```{r Sandy}
+
+#Depth, gebco.net
+
+# Get Extent of blocks_crs
+extent(blocks_crs)
+#xmin       : -125.6679 
+#xmax       : -117.097 
+#ymin       : 32.33338 
+#ymax       : 41.99988 
+
+# Read in Depth from GEBCO
+depth <- raster("data/blocks_crs_bathymetry.tif")
+# Depth boundaries were selected on GEBCO. We can define lat,long boundaries and resample
+
+# Plot Depth
+plot(depth)
+
+# View CRS
+st_crs(depth)
+
+#  Do not need to Reproject because is in WGS84
+#depth_proj <- projectRaster(depth, crs = "+proj=utm +zone=37 +south +datum=WGS84")
+
+
+# Defining miniumum and maximum depths
+min_depth <- 0
+max_depth <- -100
+# Depth limit is set at 300 m. We should verify this is correct and can change it
+  
+
+  
+# Reclassify matrix for depth layer that makes unsuitable cells 1 (>300 m), suitable cells 2 (<300 m), and NAs 0
+  rcl_mat_depth <- c(-Inf, max_depth, 1,
+                              max_depth, min_depth, 2,
+                              min_depth, 0, 1,
+                              0, Inf, 0)
+  
+# Reclassify the depth layer as binary
+  depth_binary_1 <- reclassify(depth,rcl= rcl_mat_depth)
+
+# Plot the binary depth    
+plot(depth_binary_1)
+
+# Write a Raster
+writeRaster(depth_binary_1, "data/depth_binary.tif", overwrite = T)
+
+
+# Rasterize fishing blocks
+blocks_raster <- rasterize(fishing_blocks)
+
+# Create an Empty raster
+blank_raster_crs <- raster(nrows = 2320, ncols = 2057, xmn = -125.6667, xmx = -117.0958, ymn = 32.33333, ymx = 42,
+       crs = '+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 ')
+
+# Rasterize Fishing Blocks
+blocks_rast <- rasterize(blocks_crs, blank_raster_crs)
+
+# Rasterize MPAs
+mpas_rast <- rasterize(mpa_crs, blank_raster_crs)
+
+
+# Add bathymetry to map
+blocks_crs <- blocks_sf %>% 
+  st_transform(crs = 4326)
+
+blocks_mpa_leaflet <- leaflet(options = leafletOptions(crs = epsg3310)) %>% 
+  addPolygons(data = blocks_crs,
+              fillColor = "gray",
+              weight = 1,
+              fillOpacity = 0.5) %>% 
+  addPolygons(data = mpa_crs,
+              fillColor = "red",
+              weight = 1,
+              fillOpacity = 1) 
+
+blocks_mpa_leaflet <- leaflet(options = leafletOptions(crs = epsg3310)) 
+bath_map <- addRasterImage(blocks_mpa_leaflet, depth_binary_1)
+mpa_map <- addRasterImage(bath_map, mpa_mask)
+all_map <- addRasterImage(mpa_map, blocks_rast)
+
+all_map
+
+blocks_mpa_leaflet
+
+bath_map
+
+
+# Mask Bathymetry to Fishing Blocks
+bath_mask <- mask(depth_binary_1, blocks_rast)
+
+# Mask MPAs to Fishing Blocks
+mpa_mask <- mask(mpas_rast, blocks_rast)
+
+
+plot(bath_mask)
+
+
+# Overlay Rasters
+all_rasts <- overlay(blocks_rast, mpa_mask, bath_mask, fun = function(a, b, c) {a * b * c})
+
+plot(all_rasts)
+
+
+
+###### Lauras Map
+blocks_mpa_map <- mapview(blocks_sf, 
+                          zcol = "avgoflobst", 
+                          layer.name = "Average Lobster Count") +
+  mapview(mpa_sf, 
+          zcol = "type", 
+          layer.name = "MPA Type", 
+          col.regions = mapviewPalette("mapviewSpectralColors")) +
+  mapview(bath_mask)
+
+blocks_mpa_map
+
+
+
+
+
+
+
+
+
+
+
+## Visualize fishing blocks with reserves and control blocks
+reserve_control_map_bath <- mapview(blocks_sf,
+          zcol = "block",
+          col.regions = "gray",
+          layer.name = "Fishing Blocks") +
+  mapview(lobster_reserve_blocks_sf,
+                               zcol = "block",
+                               col.regions = "red",
+                               layer.name = "Reserves") +
+  mapview(lobster_control_blocks,
+          zcol = "block",
+          col.regions = "blue",
+          layer.name = "Control Blocks") +
+  mapview(bath_mask)
+  
+
+reserve_control_map_bath
+
+
+
+
+
+
+    
+
+```
+
+```{r Peyton}
+
+
+## read in dataset containing lobster landings reported as lbs and value of catch
+lobster_pounds <- read_csv("data/#1_Lobster_landings_lbs_value_1998-2018.csv") %>% 
+  clean_names()
+
+## read in dataset containing number of lobsters caught reported from CDFW logbooks
+lobster_numbers <- read_csv("data/#2_lobster_logbook_#oflobsters_1998-2018.csv") %>% 
+  clean_names() %>% 
+  rename(season_year = season) # rename season to "season_year" so doesn't conflict with season numbering in lobster_pounds
+
+# merge two lobster data frames by Month Year and Block- want both seasons (1998-1999/1) to stay independant
+lobster_merged <- right_join(lobster_pounds,lobster_numbers,by=c("month","year","block"))
+
+
+
+# Calculate CPUE with Pounds landed 
+lobsters <- lobster_merged %>% 
+  mutate(CPUE_lbs = total_pounds_landed/total_traps_pulled) %>% 
+  mutate(CPUE_leg = total_legals_retained/total_traps_pulled)
+  
+
+
+#lobsters <- lobster_merged %>% 
+ # mutate(CPUE = total_legals_retained/total_traps_pulled)
+
+## These result in very different CPUEs..... 
+
+lobsters_CPUE <- lobsters %>% 
+  group_by(season_year, block) %>% 
+  summarise(avg_CPUE = mean(CPUE_leg), 
+            total_effort = sum(total_traps_pulled), 
+            total_catch = sum(total_legals_retained))
+
+#Not sure how to utilize these data frames - hoping to distinguish between before and after and control and reserve blocks 
+# Controls before and after Reserves 1998- 2002 and 2003- 2018
+
+controls_before<- read_csv(here("data","controls_before.csv"))
+
+controls_after <- read_csv(here("data", "controls_after.csv"))
+
+#individual block numbers for controls
+
+control_blocks_before <- unique(controls_before$block)
+control_blocks_before<- data.frame(control_blocks_before)
+
+control_blocks_after <- unique(controls_after$block)
+control_blocks_after <- data.frame(control_blocks_after)
+
+#Trying to understant overall trends for the time period 
+lobsters_effort <- lobsters_CPUE %>% 
+  group_by(season_year) %>% 
+  summarise(yr_effort = sum(total_effort),
+            yr_catch = sum(total_catch))
+
+#visualizing catch and effort
+#effort
+ggplot(lobsters_effort, aes(x = season_year,
+                            y = yr_effort))+
+  geom_point(shape=21, color="black", fill="#69b3a2", size=2)
+#catch
+ggplot(lobsters_effort, aes(x = season_year,
+                            y = yr_catch))+
+  geom_point(shape=21, color="black", fill="#69b3a2", size=2)
+
+```
+
+

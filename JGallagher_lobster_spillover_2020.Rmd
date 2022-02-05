@@ -1,0 +1,155 @@
+---
+title: "Lobster code"
+author: "Jordan Gallagher"
+date: "5/5/2020"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(error=TRUE)
+```
+
+```{r load packages and data}
+
+library(car)
+library(devtools)
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(gtools)
+library(zoo)
+library(stats)
+library(graphics)
+library(xtable)
+library(knitr)
+library(RColorBrewer)
+source_gist("524eade46135f6348140")
+library(tidyverse)
+
+lob.lbs <- read.csv("~/Desktop/Lobster/Lob2/Data/#1_Lobster_landings_lbs_value_1998-2018.csv", header=T, sep = ",", na.strings="-1")
+lob.cnt <- read.csv("~/Desktop/Lobster/Lob2/Data/#2_lobster_logbook_#oflobsters_1998-2018.csv", header=T, sep = ",", na.strings="-1")
+
+```
+
+```{r clean and merge data frames}
+
+lob.lbs$ID <- paste(lob.lbs$year, lob.lbs$month, lob.lbs$Block)
+lob.cnt$ID <- paste(lob.cnt$Year, lob.cnt$Month, lob.cnt$Block)
+
+lobsick <- merge(lob.cnt, lob.lbs, by = "ID")
+lobgnar <- subset(lobsick, select = -c(Season.y, year, month, Block.y))
+
+str(lobgnar)
+
+#make new average weight collumn
+lobgnar$avemass <- lobgnar$TotalPoundsLanded/lobgnar$TotalLegalsRetained
+
+#make CPUE in units of lbs/trap
+lobgnar$cpue <- lobgnar$TotalPoundsLanded/lobgnar$TotalTrapsPulled
+
+#once you have a file of which blocks have MPA's i'd throw that in here 
+```
+
+```{r before and after summary}
+
+#separate by before and after MPA (for our study this was just 2012, you may have multiple dates for all of the reserves in so cal so this may take more steps)
+str(lobgnar)
+lobgnar$Block.x <- as.factor(lobgnar$Block.x) 
+
+precatch <- subset(lobgnar, Year < "2012")
+recentcatch <- subset(lobgnar, Year > "2011")
+
+#summarize before after then merge again. There's probably a tidyverse way to do this without subsetting
+
+presum <- ddply(precatch, .(Block.x), summarize,
+               mean = mean(TotalPoundsLanded),
+                max=max(TotalPoundsLanded),   
+                min=min(TotalPoundsLanded), 
+                med=median(TotalPoundsLanded),
+                sd=sd(TotalPoundsLanded),
+                N=(length(TotalPoundsLanded)), 
+                se=sd(TotalPoundsLanded)/sqrt(N),
+               Status = "Pre")
+
+postsum <- ddply(recentcatch, .(Block.x), summarize,
+               mean = mean(TotalPoundsLanded),
+                max=max(TotalPoundsLanded),   
+                min=min(TotalPoundsLanded), 
+                med=median(TotalPoundsLanded),
+                sd=sd(TotalPoundsLanded),
+                N=(length(TotalPoundsLanded)), 
+                se=sd(TotalPoundsLanded)/sqrt(N),
+                  Status = "Post")
+
+catchsum <- rbind(presum, postsum)
+
+#I haven't plotted this yet since there are a bunch of blocks that seem like the don't belong in the df. but just looking at the summarized before/after it seems like there are some blocks with a dramatic change. From here I would summarize by mpa status.
+
+```
+
+```{r percent change time series}
+
+#we used 2012 as a baseline since that's when the LTER lobster surveys started, for your dataset I would use some pre-mpa average as a baseline.
+
+#these four lines define your baseline as "START". Headers will need to be changed for your dataset. This won't be that usefull until we can define blocks as either MPA or not
+
+lobgnar
+
+CHANGE <-filter(lobgnar, Year == 2012) %>% 
+  dplyr::select(Block.x, TotalPoundsLanded) %>% 
+  dplyr::rename(START = TotalPoundsLanded) %>% 
+  dplyr::right_join(lobgnar, by=c("block.x"))
+
+#create new collumns with absolute change and percent change
+
+CHANGE$ABS_CHANGE <- as.numeric(paste(round((CHANGE$TotalPoundsLanded-CHANGE$START),digits=2),sep=""))
+CHANGE$PERCENT_CHANGE <- as.numeric(paste(round((CHANGE$TotalPoundsLanded-CHANGE$START)/abs(CHANGE$START)*100,digits=1),sep=""))
+
+#recalculate with 1 replacing zero
+CHANGE$PERCENT_CHANGE[CHANGE$PERCENT_CHANGE=="NaN"] <-0
+
+#percent change by block using survey data
+CHANGE_MEAN <- CHANGE %>%
+  dplyr:: group_by(Year, block.x) %>% 
+  dplyr:: summarise(MEAN= mean(PERCENT_CHANGE,  na.rm=TRUE),
+                    SD = sd(PERCENT_CHANGE,  na.rm=TRUE), 
+                    N = length(PERCENT_CHANGE),
+                    SE = sd(PERCENT_CHANGE, na.rm=TRUE)/sqrt(N))
+
+BLOCK_PERCENT<-ggplot(data=CHANGE_MEAN, aes(x=as.numeric(as.character(YEAR)), y=MEAN, group=block.x, colour=block.x)) +
+  geom_line(lwd=1) +
+  geom_linerange(aes(ymin=MEAN-SE, ymax=MEAN+SE)) +
+  geom_hline(yintercept=0, linetype="dashed",  alpha=0.5) +
+  geom_point(size=3) +
+  scale_colour_manual(values=cbPalette) + 
+  labs(x= "Year", y = "Percent change in lobster biomass density") + 
+  theme_classic() +
+  scale_x_continuous(breaks = c(2012, 2013, 2014, 2015, 2016, 2017, 2018))+
+  theme(legend.position= c(.1, .8),
+        legend.title = element_blank(), 
+        strip.text.y = element_text(family = "Helvetica", size=14), 
+        legend.text = element_text(family = "Helvetica", size=16), 
+        axis.text.y = element_text(family="Helvetica",   colour="black", size=12),
+        axis.text.x =element_text(family="Helvetica", colour= "black", size=14),
+        axis.title =element_text(family="Helvetica", size=14))
+BLOCK_PERCENT
+
+```
+
+```{r fishable area}
+
+#code for this part of our paper was written by Bart Difiore, I need to ask him before I share it.
+# The basic structure is as followed:
+
+#call shp files, these are found on the CDFW website. We used trawl for the fishing blocks, a layer for MPA's, a layer for the 3 mile offshore boundary and a clipper file of the study area
+trawl <- readOGR("~/caltrawl/caltrawl.shp")
+
+#use the clipper file to define the area of interest for each shp file
+tr <- crop(trawl, clipper)
+
+# Extract fishable area inside three mile line within each fishery blocks
+
+```
+
