@@ -1,7 +1,5 @@
 ---
 title: "ESM 254 - Lobster Paper"
-author: "Laura Ingulsrud"
-date: "4/21/2020"
 output: html_document
 ---
 
@@ -56,24 +54,24 @@ blocks_sf <- read_sf(here("shapefiles", "CON_SCSR_CFIS_Blocks/CON_SCSR_Blocks_cl
   dplyr::select(block10_id, shape_area, shape_len, geometry) %>% 
   rename(block = block10_id)
 
-## explore blocks_sf
-object.size(blocks_sf)
-head(blocks_sf)
-class(blocks_sf)
-st_crs(blocks_sf) # EPSG: 3310
-plot(blocks_sf)
+# ## explore blocks_sf
+# object.size(blocks_sf)
+# head(blocks_sf)
+# class(blocks_sf)
+# st_crs(blocks_sf) # EPSG: 3310
+# plot(blocks_sf)
 
 
 ## read in shapefile for MPA boundaries
 mpa_sf <- read_sf(here("shapefiles", "MPAboundaries_ds582/ds582.shp")) %>% 
   clean_names()
 
-## explore mpa_sf
-object.size(mpa_sf)
-head(mpa_sf)
-class(mpa_sf)
-st_crs(mpa_sf) # EPSG: 3310
-plot(mpa_sf)
+# ## explore mpa_sf
+# object.size(mpa_sf)
+# head(mpa_sf)
+# class(mpa_sf)
+# st_crs(mpa_sf) # EPSG: 3310
+# plot(mpa_sf)
 
 ```
 
@@ -81,43 +79,69 @@ plot(mpa_sf)
 
 #Creating list of reserve blocks (blocks that should be impacted by spillover from marine reserves)
 
-## intersect fishing blocks with MPA boundaries that are buffered 10m
-reserve_blocks <- st_intersection(blocks_sf, st_buffer(mpa_sf, 10))
+## intersect fishing blocks with MPA boundaries - buffer 0 to make it work 
+blocks_sf_buffer <- st_buffer(blocks_sf, 0)
 
-## create dataframe of fishing block #s within reserves (get rid of sticky geometries)
+#check
+x <- blocks_sf_buffer %>% 
+  mutate(a  = st_area(geometry))
+
+#DO WE WANT A BUFFER? Uncomment if so
+
+#reserve_blocks <- st_intersection(blocks_sf_buffer, st_buffer(mpa_sf, 10))
+
+reserve_blocks <- st_intersection(blocks_sf_buffer,mpa_sf)
+
+## create dataframe of fishing block #s within reserves (get rid of sticky geometries) + 10m buffer
 reserve_blocks_df <- as.data.frame(reserve_blocks) %>% 
-  dplyr::select(block)
-
-## create unique list of fishing blocks within reserves + 10m buffer
-reserve_blocks_list <- reserve_blocks_df %>% 
+  dplyr::select(block) %>% 
   distinct()
 
-write_csv(reserve_blocks_list,"reserve_blocks.csv")
+
+
+
 
 ```
 
 ```{r controlblocks}
 
-#Generate list of control blocks that do not receive any spillover from reserves 
-
-## identify control fishing blocks that don't intersect reserve blocks
-
 ## create dataframe of fishing block #s (get rid of sticky geometries)
 blocks_df <- as.data.frame(blocks_sf) %>% 
   dplyr::select(block)
 
-## create list of "control" fishing blocks outside of reserves
-control_blocks_list <- anti_join(blocks_df, reserve_blocks_list)
-write.csv(control_blocks_list, "control_blocks.csv")
+#Generate list of control blocks that do not receive any spillover from reserves by antijoining the list of all fishing blocks with the list of reserves
+
+control_blocks_list <- anti_join(blocks_df, reserve_blocks_df)
+
+control_blocks_df <- as.data.frame(control_blocks_list) %>% 
+  dplyr::select(block) %>% 
+  distinct()
+
+
 
 
 
 ```
 
+```{r classification}
+
+#add classification to each dataframe and then rbind
+
+class_reserve <- reserve_blocks_df %>% 
+  mutate(classification = "reserve")
+
+class_control <- control_blocks_df %>% 
+  mutate(classification = "control")
+
+block_classification <- rbind(class_reserve,class_control)
+
+```
+
+
 ```{r lobsterblocks}
 
 
-#Joining lobster data frames and dictating as control or reserve blocks 
+#Joining lobster data frames and classifying as control or reserve blocks 
 
 
 
@@ -129,9 +153,14 @@ write.csv(control_blocks_list, "control_blocks.csv")
 
 ## review this- why call it reserve blocks- geometry only? but has all other make separate?
 lobster_reserve_blocks <- full_join(lobsters, reserve_blocks, by = c("block")) %>% 
-  mutate(classification = if_else(is.na(name), "control", "reserve"))%>% 
-  clean_names()
+  mutate(classification = if_else(is.na(name), "control", "reserve")) %>% 
+  clean_names() %>% 
+  distinct()
 
+## Or do we do it like this??
+
+test <- full_join(lobsters,block_classification, by = c("block")) %>% 
+  distinct()
 
 # Make spatial - This will have all control and reserve blocks
 lobster_reserve_blocks_sf <- lobster_reserve_blocks %>% 
@@ -142,13 +171,10 @@ lobster_reserve_blocks_sf_2 <- lobster_reserve_blocks %>%
   st_as_sf(sf_column_name = "geometry") %>% 
   filter(classification == "reserve")
 
-write.csv(lobster_reserve_blocks_sf_2, "lobster_data_reserve_blocks.csv")
 # Filter out control blocks
 lobster_control <- lobster_reserve_blocks %>% 
   filter(classification == "control") %>% 
   dplyr::select(-geometry)
-
-write.csv(lobster_control, "lobster_data_control_blocks.csv")
 
 # Join filtered out control blocks with fishing blocks shapefile by block number
 # Make spatial
@@ -171,6 +197,22 @@ reserve_pb<- lobster_reserve_blocks_sf_2 %>%
 
 control_pb<- lobster_control_blocks %>% 
   filter(block %in% (601:916))
+
+# Visualize
+lobster_study_area_map <- mapview(lobster_blocks_pb,
+          zcol = "block",
+          col.regions = "gray",
+          layer.name = "Fishing Blocks") +
+  mapview(reserve_pb,
+          zcol = "block",
+          col.regions = "red",
+          layer.name = "Marine Reserves") + 
+    mapview(control_pb,
+          zcol = "block",
+          col.regions = "blue",
+          layer.name = "Control")
+  
+lobster_study_area_map
 
 
 
@@ -280,10 +322,10 @@ season_catch <- lobster_reserve_blocks %>%
   mutate(year = as.numeric(year)) %>% 
   filter(block > 602) %>% 
   dplyr::select(-season_year, -season) %>% 
-  filter(!(block %in% c("690","689", "688" ,"711" ,"712" ,"710" ,"709", "687" ,"685", "707","708","713","714", "684", "765", "764","744","745"))) %>% 
+  filter(!(block %in% c("690","689#", "688" ,"711" ,"712" ,"710" ,"709", "687" ,"685", "707","708","713","714", "684", "765", "764","744","745"))) %>% 
   mutate(classification = as_factor(classification))
 
-write.csv(season_catch, "classificcation.csv")
+#write.csv(season_catch, "classificcation.csv")
 
 as.data.frame(season_catch)
 
@@ -297,12 +339,112 @@ reserve <- reserve_control %>%
 control <- reserve_control %>% 
   filter(classification== "control")
 
-write.csv(control, "control.csv")
-write.csv(reserve, "reserve.csv")
+# write.csv(control, "control.csv")
+# write.csv(reserve, "reserve.csv")
 
 study_blocks_list <- as.data.frame(unique(season_catch$block))
 
-write.csv(study_blocks_list, "blocks_in_analysis.csv")
+#write.csv(study_blocks_list, "blocks_in_analysis.csv")
+
+season_catch2 <- test %>% 
+  dplyr::select(block,
+                month, 
+                total_legals_retained, 
+                total_pounds_landed, 
+                total_traps_pulled, 
+                season_year,
+                total_value,
+                season,
+                classification) %>% 
+  mutate(year = case_when(season == 1 ~"1998",
+                          season == 2 ~"1999",
+                          season == 3 ~"2000",
+                          season == 4 ~"2001",
+                          season == 5 ~"2002",
+                          season == 6 ~"2003",
+                          season == 7 ~"2004",
+                          season == 8 ~"2005",
+                          season == 9 ~"2006",
+                          season == 10 ~"2007",
+                          season == 11 ~"2008",
+                          season == 12 ~"2009",
+                          season == 13 ~"2010",
+                          season == 14 ~"2011",
+                          season == 15 ~"2012",
+                          season == 16 ~"2013",
+                          season == 17 ~"2014",
+                          season == 18 ~"2015",
+                          season == 19 ~"2016",
+                          season == 20 ~"2017")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "1998-99", 
+                               "1998")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "1999-00", 
+                               "1999")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2000-01", 
+                               "2000")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2001-02", 
+                               "2001")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2002-03", 
+                               "2002")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2003-04", 
+                               "2003")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2004-05", 
+                               "2004")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2005-06", 
+                               "2005")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2006-07", 
+                               "2006")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2007-08", 
+                               "2007")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2008-09", 
+                               "2008")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2009-10", 
+                               "2009")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2010-11", 
+                               "2010")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2011-12", 
+                               "2011")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2012-13", 
+                               "2012")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2013-14", 
+                               "2013")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2014-15", 
+                               "2014")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2015-16", 
+                               "2015")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2016-17", 
+                               "2016")) %>% 
+  mutate(season_year = replace(season_year,
+                               season_year == "2017-18", 
+                               "2017")) %>% 
+  mutate(season_year = as.numeric(season_year)) %>% 
+  mutate(year = ifelse(is.na(year), season_year, year)) %>% 
+  mutate(year = as.numeric(year)) %>% 
+  filter(block > 602) %>% 
+  dplyr::select(-season_year, -season) %>% 
+  filter(!(block %in% c("690","689#", "688" ,"711" ,"712" ,"710" ,"709", "687" ,"685", "707","708","713","714", "684", "765", "764","744","745"))) %>% 
+  mutate(classification = as_factor(classification))
+
+
 
 ```
 
@@ -328,6 +470,19 @@ omit_lbs <- season_catch %>%
 omit_na_lbs <- omit_lbs %>% 
   na.omit()
 
+#test
+omit_lbs2 <- season_catch2 %>% 
+  dplyr::select(block, 
+                month, 
+                total_pounds_landed, 
+                total_traps_pulled, 
+                classification, 
+                year,
+                total_value)
+
+omit_na_lbs2 <- omit_lbs2 %>% 
+  na.omit()
+
 
 #doing it in separate data frames allows me to omit jsut the data that we need for this calc (lbs and traps)
   
@@ -348,7 +503,16 @@ lobster_summary_lbs <- omit_na_lbs %>%
 
 
 
-
+#test
+          lobster_summary_lbs2 <- omit_na_lbs2 %>% 
+  group_by(classification, year) %>% 
+  summarise(total_traps = sum(total_traps_pulled), 
+            season_pounds_landed = sum(total_pounds_landed), 
+            sd_traps = round(sd(total_traps_pulled), digits = 3),             sd_pounds = round(sd(total_pounds_landed), digits = 3),
+          value = sum(total_value))
+  
+          lobster_summary_lbs <- lobster_summary_lbs %>%
+        mutate(CPUE_lbs = season_pounds_landed/total_traps)
 ###########################################
 #Making a summary table for legals retained
 #Calculating cpue 
@@ -405,9 +569,17 @@ coastal_pounds_ba <- lobster_summary_lbs %>%
   mutate(log_traps = log(total_traps +1)) %>% 
   mutate(log_pounds = log(season_pounds_landed + 1)) %>% 
   mutate(period = if_else(years_ba_res > 0,"after", "before")) %>% 
-   mutate(period = as_factor(period))
+  mutate(period = as_factor(period))
 
-write.csv(coastal_pounds_ba, "all_blocks_pounds_comparison_10-4-2020.csv")
+coastal_pounds_ba2 <- lobster_summary_lbs2 %>% 
+  filter(year > 2005) %>% 
+  mutate(years_ba_res = year-2011) %>% 
+  mutate(log_traps = log(total_traps +1)) %>% 
+  mutate(log_pounds = log(season_pounds_landed + 1)) %>% 
+  mutate(period = if_else(years_ba_res > 0,"after", "before")) %>% 
+  mutate(period = as_factor(period))
+
+#write.csv(coastal_pounds_ba, "all_blocks_pounds_comparison_10-4-2020.csv")
 view(coastal_pounds_ba)
 
 ### looking at legals retained before and after
